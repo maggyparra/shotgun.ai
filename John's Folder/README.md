@@ -1,65 +1,27 @@
-# Shotgun Map
+# John's Folder — Shotgun.ai
 
-A lightweight, Google Maps–style web app with **turn-by-turn instructions**, **map display**, and **address search**. No API key required to run (uses free OSM + OSRM).
+Maggie's stack (Next.js, Google Maps, Convex) with John's UX:
 
-## What’s included
+- **Slow simulation** — Drive sim runs at ~1.2s per step (was 150ms) so you can follow along.
+- **Map follows you** — Map centers on your current position at zoom 17 and pans as you move.
+- **Turn-by-turn banner** — Fixed bar at the top shows the *next* instruction and distance to that turn (e.g. "Turn left onto Main St" · "in 240 m"). Updates after you pass each step.
+- **Voice copilot** — Tap the mic (bottom-right) to talk. Ask for navigation help ("before or after the McDonald's?"), add a stop, "what's that on the left?", "how's the weather on my route?", or general questions. Uses Web Speech API for speech-to-text; replies use **MiniMax TTS** (human-like) when `MINIMAX_API_KEY` is set, else browser TTS. Context includes position, route, nearby POIs (with distance and left/right), area (Mapbox), and weather.
 
-- **Turn-by-turn instructions** in the sidebar (distance + text per step)
-- **Route line** on the map with total distance and time
-- **Address search** (From / To) via Nominatim geocoding
-- **Click map** to set start (first click) and destination (second click)
-- **Follow mode**: local overhead view that keeps the map centered on your location (GPS) as you move
-- **Simulate drive**: after getting a route, run a simulated drive along the path with the same overhead follow view (no GPS needed)
-- **OpenStreetMap** tiles and **OSRM** routing (free, open source)
+## Run locally
 
-## Quick start
-
-```bash
-npm install
-npm run dev
-```
-
-Open http://localhost:5173 and enter two addresses (e.g. “Times Square, NYC” and “Brooklyn Bridge, NYC”), then click **Get route**.
+1. Copy `.env.local` from Maggie's Folder or create one with:
+   - `NEXT_PUBLIC_CONVEX_URL` and `NEXT_PUBLIC_GOOGLE_MAPS_API_KEY`
+   - `OPENAI_API_KEY` (for the voice copilot AI)
+   - Optional: `MAPBOX_ACCESS_TOKEN` (area name + enrichment), `MINIMAX_API_KEY` (human-like TTS)
+2. From this folder:
+   ```bash
+   npm install
+   npm run dev
+   ```
+3. Open [http://localhost:3000](http://localhost:3000). Click the map to set a destination, then **Go (slow simulation)**.
 
 ## Stack
 
-| Piece        | Tech              | Notes                                      |
-|-------------|-------------------|--------------------------------------------|
-| Map         | [Leaflet](https://leafletjs.com/) | Renders OSM tiles and route line           |
-| Routing UI  | [Leaflet Routing Machine](https://github.com/perliedman/leaflet-routing-machine) | Turn-by-turn + OSRM integration |
-| Routing API | [OSRM](https://project-osrm.org/) (public demo) | 1 request/sec limit; demo only            |
-| Geocoding   | [Nominatim](https://nominatim.openstreetmap.org/) | OSM geocoding; ~1 req/sec                  |
-
-## Production / “faster” options
-
-The app is wired so you can swap the routing backend without changing the UI:
-
-1. **Mapbox Directions API**  
-   - Free tier: 100k requests/month.  
-   - In `src/main.js`, use `L.Routing.mapbox('YOUR_ACCESS_TOKEN')` as the `router` instead of `L.Routing.osrmv1(...)`.
-
-2. **GraphHopper**  
-   - Free tier available.  
-   - Use the [lrm-graphhopper](https://github.com/perliedman/lrm-graphhopper) plugin and pass it as `router`.
-
-3. **Self-hosted OSRM**  
-   - No rate limit; you control updates.  
-   - Set `router: L.Routing.osrmv1({ serviceUrl: 'https://your-osrm-server/route/v1' })`.
-
-4. **Google Maps**  
-   - **Fully usable for web**: use the [Maps JavaScript API](https://developers.google.com/maps/documentation/javascript) with the [Directions API](https://developers.google.com/maps/documentation/directions) or [Routes API](https://developers.google.com/maps/documentation/routes) for routing and turn-by-turn. The *Navigation SDK* is Android/iOS-only; for web you use the JS API + Directions/Routes.  
-   - Best data quality and traffic; pay-per-use pricing.
-
-## Attribution
-
-- © [OpenStreetMap](https://www.openstreetmap.org/copyright) contributors  
-- Routing: [OSRM](https://project-osrm.org/)
-
-## Build
-
-```bash
-npm run build
-npm run preview
-```
-
-Built files are in `dist/`.
+- Next.js 16, React 19
+- Google Maps (Directions, Places, Geometry)
+- Convex (stops)
