@@ -1,17 +1,13 @@
 "use client"
 
 /**
- * Map Dashboard — Maggie's Google Maps + Convex, with John's:
- * - Slow simulation (1200ms per step)
- * - Map zooms/follows current location (zoom 17)
- * - Turn-by-turn banner at top: next instruction + distance to that turn
+ * Map Dashboard — Google Maps + Convex: simulation, follow-cam, turn-by-turn banner, voice copilot.
  */
 
 import {
   GoogleMap,
   useJsApiLoader,
   Marker,
-  Polyline,
   Circle,
   type Libraries,
 } from "@react-google-maps/api"
@@ -112,6 +108,54 @@ function closestPathIndex(
   return best
 }
 
+/** One continuous path: origin → … → stop → … → destination.
+ * Uses the route’s overview_path (single polyline from Google) so we never draw two segments.
+ * Steps and waypoints are built from legs for turn-by-turn and pins. */
+function buildPathStepsAndWaypointsFromRoute(
+  route: google.maps.DirectionsRoute
+): { pathLatLng: { lat: number; lng: number }[]; steps: RouteStep[]; waypoints: { lat: number; lng: number; name?: string }[] } {
+  const legs = route.legs ?? []
+  // Use overview_path so we have exactly one continuous line (optimal route) for the whole journey
+  const pathLatLng: { lat: number; lng: number }[] =
+    route.overview_path && route.overview_path.length > 0
+      ? route.overview_path.map((p) => ({ lat: p.lat(), lng: p.lng() }))
+      : []
+
+  const steps: RouteStep[] = []
+  legs.forEach((leg: google.maps.DirectionsLeg) => {
+    (leg.steps ?? []).forEach((s: google.maps.DirectionsStep) => {
+      const pathIndex =
+        pathLatLng.length > 0 && s.start_location
+          ? closestPathIndex(pathLatLng, s.start_location.lat(), s.start_location.lng())
+          : 0
+      steps.push({
+        instructionText: s.instructions ? stripHtml(s.instructions) : "Continue",
+        pathIndex,
+      })
+    })
+  })
+
+  // If no overview_path (shouldn’t happen), build path from legs so we still have something to draw
+  if (pathLatLng.length === 0) {
+    for (const leg of legs) {
+      const stepList = leg.steps ?? []
+      for (let i = 0; i < stepList.length; i++) {
+        const s = stepList[i]
+        if (pathLatLng.length === 0)
+          pathLatLng.push({ lat: s.start_location.lat(), lng: s.start_location.lng() })
+        pathLatLng.push({ lat: s.end_location.lat(), lng: s.end_location.lng() })
+      }
+    }
+  }
+
+  const waypoints = legs.slice(0, -1).map((leg) => ({
+    lat: leg.end_location.lat(),
+    lng: leg.end_location.lng(),
+    name: leg.end_address,
+  }))
+  return { pathLatLng, steps, waypoints }
+}
+
 /** Keep banner instruction readable: normalize spaces, cap length */
 function formatBannerInstruction(text: string, maxLen = 70): string {
   const t = text.replace(/\s+/g, " ").trim()
@@ -151,8 +195,10 @@ export function MapDashboard() {
     destinationName,
     tickCar,
     routeSteps,
+    routeWaypoints,
     navigationMode,
     updatePositionFromGps,
+    routeVersion,
   } = useNavigation()
   const [map, setMap] = useState<google.maps.Map | null>(null)
   const [mapCenter, setMapCenter] = useState(defaultCenter)
@@ -193,6 +239,8 @@ export function MapDashboard() {
   destinationRef.current = destination
   carPositionRef.current = carPosition
   destinationNameRef.current = destinationName
+  /** Exactly ONE route polyline on the map. Remove before creating a new one. */
+  const currentRoutePolylineRef = useRef<google.maps.Polyline | null>(null)
   const [isSimulationPaused, setIsSimulationPaused] = useState(false)
   const [userLocation, setUserLocation] = useState<{
     lat: number
@@ -291,8 +339,43 @@ export function MapDashboard() {
       google.maps.event.removeListener(dragListenerRef.current)
       dragListenerRef.current = null
     }
+    if (currentRoutePolylineRef.current) {
+      currentRoutePolylineRef.current.setMap(null)
+      currentRoutePolylineRef.current = null
+    }
     setMap(null)
   }, [])
+
+  // Single route polyline: remove any existing one, then create and add exactly one for the current path.
+  // Include routeVersion so when we add a stop and replace the route, the line always redraws.
+  useEffect(() => {
+    const mapInstance = map
+    const pathCoords = path.length > 0 ? path.map((p) => ({ lat: p.lat, lng: p.lng })) : []
+
+    if (currentRoutePolylineRef.current != null) {
+      currentRoutePolylineRef.current.setMap(null)
+      currentRoutePolylineRef.current = null
+    }
+
+    if (pathCoords.length === 0 || !mapInstance || typeof google === "undefined") return
+
+    const polyline = new google.maps.Polyline({
+      path: pathCoords,
+      geodesic: false,
+      strokeColor: "#1a73e8",
+      strokeOpacity: 0.9,
+      strokeWeight: 5,
+    })
+    polyline.setMap(mapInstance)
+    currentRoutePolylineRef.current = polyline
+
+    return () => {
+      if (currentRoutePolylineRef.current === polyline) {
+        currentRoutePolylineRef.current.setMap(null)
+        currentRoutePolylineRef.current = null
+      }
+    }
+  }, [map, path, routeVersion])
 
   useEffect(() => {
     if (!isGoMode || path.length === 0 || navigationMode !== "simulation") {
@@ -431,24 +514,11 @@ export function MapDashboard() {
               travelMode: google.maps.TravelMode.DRIVING,
             },
             (result, status) => {
-              if (status === "OK" && result?.routes?.[0]?.overview_path?.length) {
-                const pathLatLng = result.routes[0].overview_path.map((p) => ({
-                  lat: p.lat(),
-                  lng: p.lng(),
-                }))
-                const legs = result.routes[0].legs ?? []
-                const steps: RouteStep[] = []
-                for (const leg of legs) {
-                  for (const s of leg.steps ?? []) {
-                    steps.push({
-                      instructionText: s.instructions ? stripHtml(s.instructions) : "Continue",
-                      pathIndex: s.start_location
-                        ? closestPathIndex(pathLatLng, s.start_location.lat(), s.start_location.lng())
-                        : 0,
-                    })
-                  }
-                }
-                startNavigationWithPath(pathLatLng, destinationNameRef.current ?? undefined, steps, navigationMode)
+              if (status === "OK" && result?.routes?.[0]?.legs?.length) {
+                const { pathLatLng, steps, waypoints: routeWps } = buildPathStepsAndWaypointsFromRoute(result.routes[0])
+                startNavigationWithPath(pathLatLng, destinationNameRef.current ?? undefined, steps, navigationMode, routeWps)
+                setSelectedDestination(null)
+                setWaypoints([])
               }
             }
           )
@@ -535,7 +605,6 @@ export function MapDashboard() {
     )
   }
 
-  const pathForPolyline = path.map((p) => ({ lat: p.lat, lng: p.lng }))
   const mapOptions: google.maps.MapOptions = {
     ...mapOptionsBase,
     center: mapCenter,
@@ -639,25 +708,12 @@ export function MapDashboard() {
             travelMode: google.maps.TravelMode.DRIVING,
           },
           (result, status) => {
-            if (status !== "OK" || !result?.routes?.[0]?.overview_path?.length) return
-            const pathLatLng = result.routes[0].overview_path.map((p: google.maps.LatLng) => ({
-              lat: p.lat(),
-              lng: p.lng(),
-            }))
-            const legs = result.routes[0].legs ?? []
-            const steps: RouteStep[] = []
-            legs.forEach((leg: google.maps.DirectionsLeg) => {
-              ;(leg.steps ?? []).forEach((s: google.maps.DirectionsStep) => {
-                steps.push({
-                  instructionText: s.instructions ? stripHtml(s.instructions) : "Continue",
-                  pathIndex: s.start_location
-                    ? closestPathIndex(pathLatLng, s.start_location.lat(), s.start_location.lng())
-                    : 0,
-                })
-              })
-            })
+            if (status !== "OK" || !result?.routes?.[0]?.legs?.length) return
+            const { pathLatLng, steps, waypoints: waypointsFromLegs } = buildPathStepsAndWaypointsFromRoute(result.routes[0])
             setIsSimulationPaused(false)
-            startNavigationWithPath(pathLatLng, destinationName ?? undefined, steps, navigationMode)
+            startNavigationWithPath(pathLatLng, destinationName ?? undefined, steps, navigationMode, waypointsFromLegs)
+            setSelectedDestination(null)
+            setWaypoints([])
           }
         )
       } else {
@@ -1019,7 +1075,7 @@ export function MapDashboard() {
           }}
           options={mapOptions}
         >
-          {selectedDestination && (
+          {selectedDestination && !isGoMode && (
             <Marker
               position={{
                 lat: selectedDestination.lat,
@@ -1035,7 +1091,7 @@ export function MapDashboard() {
               }}
             />
           )}
-          {waypoints.map((wp, i) => (
+          {!isGoMode && waypoints.map((wp, i) => (
             <Marker
               key={i}
               position={{ lat: wp.lat, lng: wp.lng }}
@@ -1078,16 +1134,6 @@ export function MapDashboard() {
               />
             </>
           )}
-          {pathForPolyline.length > 0 && (
-            <Polyline
-              path={pathForPolyline}
-              options={{
-                strokeColor: "#22d3ee",
-                strokeOpacity: 0.9,
-                strokeWeight: 5,
-              }}
-            />
-          )}
           {isGoMode && (carPosition || smoothCarPosition) && (
             <Marker
               position={
@@ -1106,18 +1152,17 @@ export function MapDashboard() {
               }}
             />
           )}
+          {routeWaypoints.map((wp, i) => (
+            <Marker
+              key={`waypoint-${i}`}
+              position={{ lat: wp.lat, lng: wp.lng }}
+              title={wp.name ?? `Stop ${i + 1}`}
+            />
+          ))}
           {destination && (
             <Marker
               position={destination}
               title="Destination"
-              icon={{
-                path: google.maps.SymbolPath.CIRCLE,
-                scale: 10,
-                fillColor: "#22c55e",
-                fillOpacity: 1,
-                strokeColor: "#1e293b",
-                strokeWeight: 2,
-              }}
             />
           )}
           {stops.map((stop) => (
@@ -1242,30 +1287,11 @@ export function MapDashboard() {
                       (result, status) => {
                         if (
                           status === "OK" &&
-                          result?.routes?.[0]?.overview_path?.length
+                          result?.routes?.[0]?.legs?.length
                         ) {
-                          const pathLatLng = result.routes[0].overview_path.map(
-                            (p) => ({ lat: p.lat(), lng: p.lng() })
-                          )
-                          const legs = result.routes[0].legs ?? []
-                          const steps: RouteStep[] = []
-                          for (const leg of legs) {
-                            for (const s of leg.steps ?? []) {
-                              const instructionText = s.instructions
-                                ? stripHtml(s.instructions)
-                                : "Continue"
-                              const pathIndex = s.start_location
-                                ? closestPathIndex(
-                                    pathLatLng,
-                                    s.start_location.lat(),
-                                    s.start_location.lng()
-                                  )
-                                : 0
-                              steps.push({ instructionText, pathIndex })
-                            }
-                          }
+                          const { pathLatLng, steps, waypoints: routeWps } = buildPathStepsAndWaypointsFromRoute(result.routes[0])
                           setIsSimulationPaused(false)
-                          startNavigationWithPath(pathLatLng, destName, steps, mode)
+                          startNavigationWithPath(pathLatLng, destName, steps, mode, routeWps)
                         } else {
                           setIsSimulationPaused(false)
                           startNavigationWithPath([origin, dest], destName, undefined, mode)
@@ -1316,30 +1342,11 @@ export function MapDashboard() {
                       (result, status) => {
                         if (
                           status === "OK" &&
-                          result?.routes?.[0]?.overview_path?.length
+                          result?.routes?.[0]?.legs?.length
                         ) {
-                          const pathLatLng = result.routes[0].overview_path.map(
-                            (p) => ({ lat: p.lat(), lng: p.lng() })
-                          )
-                          const legs = result.routes[0].legs ?? []
-                          const steps: RouteStep[] = []
-                          for (const leg of legs) {
-                            for (const s of leg.steps ?? []) {
-                              const instructionText = s.instructions
-                                ? stripHtml(s.instructions)
-                                : "Continue"
-                              const pathIndex = s.start_location
-                                ? closestPathIndex(
-                                    pathLatLng,
-                                    s.start_location.lat(),
-                                    s.start_location.lng()
-                                  )
-                                : 0
-                              steps.push({ instructionText, pathIndex })
-                            }
-                          }
+                          const { pathLatLng, steps, waypoints: routeWps } = buildPathStepsAndWaypointsFromRoute(result.routes[0])
                           setIsSimulationPaused(false)
-                          startNavigationWithPath(pathLatLng, destName, steps, mode)
+                          startNavigationWithPath(pathLatLng, destName, steps, mode, routeWps)
                         } else {
                           setIsSimulationPaused(false)
                           startNavigationWithPath([origin, dest], destName, undefined, mode)

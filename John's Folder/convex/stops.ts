@@ -32,3 +32,10 @@ export const listStops = query({
     return all.sort((a, b) => b.createdAt - a.createdAt).slice(0, 50)
   },
 })
+
+export const removeStop = mutation({
+  args: { id: v.id("stops") },
+  handler: async (ctx, args) => {
+    await ctx.db.delete(args.id)
+  },
+})

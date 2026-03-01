@@ -13,10 +13,9 @@ export function Providers({ children }: { children: React.ReactNode }) {
         <div className="max-w-md rounded-lg border border-amber-200 bg-amber-50 p-6 text-amber-900">
           <p className="font-semibold">Convex URL required</p>
           <p className="mt-2 text-sm">
-            Add <code className="rounded bg-amber-100 px-1">NEXT_PUBLIC_CONVEX_URL</code> to a{" "}
-            <code className="rounded bg-amber-100 px-1">.env.local</code> file in John&apos;s Folder, then restart the dev server.
+            Add <code className="rounded bg-amber-100 px-1">NEXT_PUBLIC_CONVEX_URL</code> to <code className="rounded bg-amber-100 px-1">.env.local</code> in the project root, then restart the dev server.
           </p>
-          <p className="mt-2 text-sm">Get the URL from Maggie or run <code className="rounded bg-amber-100 px-1">npx convex dev</code> to create one.</p>
+          <p className="mt-2 text-sm">Run <code className="rounded bg-amber-100 px-1">npx convex dev</code> from the project root to create a dev deployment and get the URL. See <code className="rounded bg-amber-100 px-1">CONVEX.md</code> for details.</p>
         </div>
       </div>
     )

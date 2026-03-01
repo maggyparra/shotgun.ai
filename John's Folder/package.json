@@ -1,5 +1,5 @@
 {
-  "name": "shotgunai-john",
+  "name": "shotgun.ai",
   "version": "0.1.0",
   "private": true,
   "scripts": {
@@ -24,6 +24,6 @@
     "eslint": "^9",
     "eslint-config-next": "16.1.6",
     "tailwindcss": "^4",
-    "typescript": "^5"
+    "typescript": "5.9.3"
   }
 }

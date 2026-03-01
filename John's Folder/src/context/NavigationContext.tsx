@@ -12,6 +12,9 @@ import { snapToPath } from "@/lib/pathUtils"
 
 export type LatLng = { lat: number; lng: number }
 
+/** Waypoint/stop along the route (for markers when in go mode) */
+export type RouteWaypoint = { lat: number; lng: number; name?: string }
+
 /** One turn-by-turn step: instruction text + index into path where it applies */
 export type RouteStep = {
   instructionText: string
@@ -28,8 +31,12 @@ export type NavigationState = {
   startPoint: LatLng | null
   destination: LatLng | null
   destinationName: string | null
+  /** Stops/waypoints along the route (in order); shown as pins when in go mode */
+  routeWaypoints: RouteWaypoint[]
   /** Turn-by-turn steps with path indices for banner + distance-to-turn */
   routeSteps: RouteStep[]
+  /** Bumped whenever the route is replaced (e.g. add stop); used so the map removes the old line. */
+  routeVersion: number
 }
 
 type NavigationActions = {
@@ -37,12 +44,13 @@ type NavigationActions = {
   setDestination: (lat: number, lng: number, name?: string) => void
   setPath: (path: LatLng[]) => void
   startGoMode: () => void
-  /** Start navigation with path and steps; mode = 'real' (GPS) or 'simulation' (tick-based dot) */
+  /** Start navigation with path and steps; mode = 'real' (GPS) or 'simulation' (tick-based dot). waypoints = stops along the route (for pins). */
   startNavigationWithPath: (
     path: LatLng[],
     destinationName?: string,
     steps?: RouteStep[],
-    mode?: "real" | "simulation"
+    mode?: "real" | "simulation",
+    waypoints?: RouteWaypoint[]
   ) => void
   stopGoMode: () => void
   setCarIndex: (index: number) => void
@@ -60,7 +68,9 @@ const defaultState: NavigationState = {
   startPoint: null,
   destination: null,
   destinationName: null,
+  routeWaypoints: [],
   routeSteps: [],
+  routeVersion: 0,
 }
 
 const NavigationContext = createContext<
@@ -104,7 +114,7 @@ export function NavigationProvider({ children }: { children: ReactNode }) {
   }, [])
 
   const startNavigationWithPath = useCallback(
-    (path: LatLng[], destinationName?: string, steps?: RouteStep[], mode: "real" | "simulation" = "simulation") => {
+    (path: LatLng[], destinationName?: string, steps?: RouteStep[], mode: "real" | "simulation" = "simulation", waypoints?: RouteWaypoint[]) => {
       if (path.length === 0) return
       const last = path[path.length - 1]
       setState((s) => ({
@@ -116,7 +126,9 @@ export function NavigationProvider({ children }: { children: ReactNode }) {
         carPosition: path[0],
         destination: last,
         destinationName: destinationName ?? null,
+        routeWaypoints: waypoints ?? [],
         routeSteps: steps ?? [],
+        routeVersion: (s.routeVersion ?? 0) + 1,
       }))
     },
     [],
