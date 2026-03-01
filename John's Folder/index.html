@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Shotgun Map – Lightweight navigation</title>
+    <link rel="stylesheet" href="/src/style.css" />
+  </head>
+  <body>
+    <div id="next-direction-banner" class="next-direction-banner" aria-live="polite" hidden>
+      <span class="banner-instruction"></span>
+      <span class="banner-distance"></span>
+    </div>
+    <div id="app">
+      <header class="header">
+        <h1>Shotgun Map</h1>
+        <p class="tagline">Turn-by-turn • OSM • No API key required</p>
+      </header>
+      <aside class="sidebar">
+        <div class="search-box">
+          <label for="from">From</label>
+          <div class="from-row">
+            <input type="text" id="from" placeholder="Start address or click map" />
+            <button type="button" id="use-my-location-btn" title="Use my current location">Use my location</button>
+          </div>
+          <label for="to">To</label>
+          <input type="text" id="to" placeholder="Destination" />
+          <button type="button" id="route-btn">Get route</button>
+          <div class="nav-controls">
+            <label class="toggle">
+              <input type="checkbox" id="follow-toggle" />
+              <span>Follow my location</span>
+            </label>
+            <button type="button" id="simulate-btn" disabled>Simulate drive</button>
+            <div class="location-help">
+              <p class="location-help-text">GPS needs permission. Use <strong>localhost</strong> or <strong>HTTPS</strong>, then click below to allow.</p>
+              <button type="button" id="allow-location-btn">Allow location</button>
+            </div>
+          </div>
+        </div>
+        <div class="instructions-panel">
+          <h3>Turn-by-turn</h3>
+          <div id="instructions" aria-live="polite"></div>
+        </div>
+        <div class="attribution">
+          © <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> · Routing: <a href="https://project-osrm.org/">OSRM</a>
+        </div>
+      </aside>
+      <main id="map"></main>
+    </div>
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>
