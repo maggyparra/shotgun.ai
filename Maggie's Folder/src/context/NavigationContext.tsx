@@ -52,6 +52,8 @@ type NavigationActions = {
   setPath: (path: LatLng[]) => void
   /** Swap path but preserve car position — find closest point on new path, no reset to origin */
   setPathPreservingPosition: (path: LatLng[]) => void
+  /** Clear path for reroute (keeps car position so marker stays visible) */
+  clearPathForReroute: () => void
   startGoMode: () => void
   /** Start GO mode with a path in one update so path + car + isGoMode are set together */
   startNavigationWithPath: (path: LatLng[], destinationName?: string) => void
@@ -127,6 +129,10 @@ export function NavigationProvider({ children }: { children: ReactNode }) {
     })
   }, [])
 
+  const clearPathForReroute = useCallback(() => {
+    setState((s) => ({ ...s, path: [] }))
+  }, [])
+
   const startGoMode = useCallback(() => {
     setState((s) => ({
       ...s,
@@ -195,6 +201,7 @@ export function NavigationProvider({ children }: { children: ReactNode }) {
       setDestination,
       setPath,
       setPathPreservingPosition,
+      clearPathForReroute,
       startGoMode,
       startNavigationWithPath,
       stopGoMode,
@@ -208,6 +215,7 @@ export function NavigationProvider({ children }: { children: ReactNode }) {
       setDestination,
       setPath,
       setPathPreservingPosition,
+      clearPathForReroute,
       startGoMode,
       startNavigationWithPath,
       stopGoMode,

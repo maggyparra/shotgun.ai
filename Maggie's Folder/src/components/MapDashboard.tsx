@@ -116,6 +116,7 @@ function stripHtml(html: string): string {
 /** Memoized map content — does not re-render when only carPosition/carIndex changes during turn-by-turn */
 const MapContent = React.memo(function MapContent({
   pathForPolyline,
+  pathRerouteKey,
   mapOptions,
   mapCenter,
   selectedDestination,
@@ -129,6 +130,7 @@ const MapContent = React.memo(function MapContent({
   onClick,
 }: {
   pathForPolyline: { lat: number; lng: number }[]
+  pathRerouteKey: number
   mapOptions: google.maps.MapOptions
   mapCenter: { lat: number; lng: number }
   selectedDestination: { lat: number; lng: number; address: string; durationMinutes: number; steps: string[] } | null
@@ -200,7 +202,7 @@ const MapContent = React.memo(function MapContent({
         </>
       )}
       {pathForPolyline.length > 0 && (
-        <>
+        <React.Fragment key={`path-${pathRerouteKey}`}>
           <Polyline
             path={pathForPolyline}
             options={{
@@ -217,7 +219,7 @@ const MapContent = React.memo(function MapContent({
               strokeWeight: 8,
             }}
           />
-        </>
+        </React.Fragment>
       )}
       {isGoMode && <CarMarkerOverlay positionRef={smoothPosRef} visible />}
       {destination && (
@@ -289,6 +291,7 @@ export function MapDashboard() {
     replayNavigation,
     setPath,
     setPathPreservingPosition,
+    clearPathForReroute,
   } = useNavigation()
   const [map, setMap] = useState<google.maps.Map | null>(null)
   const [mapCenter, setMapCenter] = useState<{ lat: number; lng: number }>(defaultCenter)
@@ -402,8 +405,9 @@ export function MapDashboard() {
     }
   }, [isGoMode, path.length, tickCar, isSimulationPaused, tickIntervalMs])
 
-  // When stops are added: request OPTIMIZED route (shortest) from current position → stops → destination
+  // When stops are added: clear old path first, then request fresh route (fixes path overlap)
   const prevStopsLen = useRef(0)
+  const [pathRerouteKey, setPathRerouteKey] = useState(0)
   useEffect(() => {
     if (!isGoMode || path.length === 0 || !destination || stops.length <= prevStopsLen.current) {
       prevStopsLen.current = stops.length
@@ -415,6 +419,8 @@ export function MapDashboard() {
     if (newStops.length === 0) return
 
     setIsCalculatingReroute(true)
+    clearPathForReroute()
+    setPathRerouteKey((k) => k + 1)
     if (typeof google === "undefined" || !google.maps?.DirectionsService) {
       setIsCalculatingReroute(false)
       return
@@ -434,11 +440,12 @@ export function MapDashboard() {
         setIsCalculatingReroute(false)
         if (status === "OK" && result?.routes?.[0]?.overview_path?.length) {
           const pathLatLng = result.routes[0].overview_path.map((p) => ({ lat: p.lat(), lng: p.lng() }))
+          setPathRerouteKey((k) => k + 1)
           setPathPreservingPosition(pathLatLng)
         }
       }
     )
-  }, [isGoMode, path, destination, stops, carPosition, carIndex, setPathPreservingPosition])
+  }, [isGoMode, path, destination, stops, carPosition, carIndex, setPathPreservingPosition, clearPathForReroute])
 
   // When car reaches a stop: pause, wait, remove stop, reroute to destination
   const ARRIVAL_THRESHOLD_M = 80
@@ -455,6 +462,8 @@ export function MapDashboard() {
       const stopPos = { lat: stop.lat, lng: stop.lng }
       const timer = setTimeout(() => {
         removeStopMutation({ id: stop._id })
+        clearPathForReroute()
+        setPathRerouteKey((k) => k + 1)
         if (typeof google === "undefined" || !google.maps?.DirectionsService) {
           setIsSimulationPaused(false)
           setAgentResponse(null)
@@ -472,6 +481,7 @@ export function MapDashboard() {
             setAgentResponse(null)
             if (status === "OK" && result?.routes?.[0]?.overview_path?.length) {
               const newPath = result.routes[0].overview_path.map((p) => ({ lat: p.lat(), lng: p.lng() }))
+              setPathRerouteKey((k) => k + 1)
               setPath(newPath)
             }
           }
@@ -479,7 +489,7 @@ export function MapDashboard() {
       }, PAUSE_AT_STOP_MS)
       return () => clearTimeout(timer)
     }
-  }, [isGoMode, carPosition, destination, stops, removeStopMutation, setPath, setAgentResponse])
+  }, [isGoMode, carPosition, destination, stops, removeStopMutation, setPath, setAgentResponse, clearPathForReroute])
 
   // Smooth interpolation: animate over full tick interval so car moves at constant rate (no bursts)
   useEffect(() => {
@@ -624,13 +634,12 @@ export function MapDashboard() {
         const noMatch = /\b(no|nope|nah|cancel|nevermind|stick to)\b/i
         if (yesMatch.test(c) || yesMatch.test(t)) {
           addStopMutation({ label: pendingProposal.name, lat: pendingProposal.lat, lng: pendingProposal.lng })
-          setAgentResponse("Added. WE are updating the route.")
           lastTriggeredPlaceRef.current = ""
           clearProposal()
         } else if (noMatch.test(c) || noMatch.test(t)) {
-          setAgentResponse("Understood. Say 'add a stop to [place]' to try a different stop.")
           setStatus("idle")
           setPendingProposal(null)
+          setAgentResponse(null)
           setError(null)
           lastTriggeredPlaceRef.current = ""
         }
@@ -714,6 +723,7 @@ export function MapDashboard() {
       <div className="absolute inset-0 w-full" style={{ height: "100vh" }}>
         <MapContent
           pathForPolyline={pathForPolyline}
+          pathRerouteKey={pathRerouteKey}
           mapOptions={mapOptions}
           mapCenter={mapCenter}
           selectedDestination={selectedDestination}
@@ -824,7 +834,6 @@ export function MapDashboard() {
               pendingProposal
                 ? () => {
                     addStopMutation({ label: pendingProposal!.name, lat: pendingProposal!.lat, lng: pendingProposal!.lng })
-                    setAgentResponse("Added. WE are updating the route.")
                     lastTriggeredPlaceRef.current = ""
                     clearProposal()
                   }
@@ -833,16 +842,34 @@ export function MapDashboard() {
             onCancelStop={
               pendingProposal
                 ? () => {
-                    setAgentResponse("Understood. Say 'add a stop to [place]' to try a different stop.")
                     setStatus("idle")
                     setPendingProposal(null)
+                    setAgentResponse(null)
                     setError(null)
                     lastTriggeredPlaceRef.current = ""
                   }
                 : undefined
             }
           />
-          <div className="absolute left-4 right-4 top-4 z-10 flex items-center gap-4 rounded-2xl border border-white/30 bg-white/40 px-6 py-4 text-zinc-900 shadow-lg backdrop-blur-2xl backdrop-saturate-150">
+          <div className="absolute right-4 top-4 z-10 flex flex-col gap-2">
+            <button
+              type="button"
+              onClick={() => map?.setZoom((map?.getZoom() ?? 17) + 1)}
+              className="flex h-12 w-12 items-center justify-center rounded-2xl border border-white/30 bg-white/40 text-2xl font-bold text-zinc-900 shadow-lg backdrop-blur-xl transition hover:bg-white/60 active:scale-95"
+              aria-label="Zoom in"
+            >
+              +
+            </button>
+            <button
+              type="button"
+              onClick={() => map?.setZoom(Math.max(1, (map?.getZoom() ?? 17) - 1))}
+              className="flex h-12 w-12 items-center justify-center rounded-2xl border border-white/30 bg-white/40 text-2xl font-bold text-zinc-900 shadow-lg backdrop-blur-xl transition hover:bg-white/60 active:scale-95"
+              aria-label="Zoom out"
+            >
+              −
+            </button>
+          </div>
+          <div className="absolute left-4 right-20 top-4 z-10 flex items-center gap-4 rounded-2xl border border-white/30 bg-white/40 px-6 py-4 text-zinc-900 shadow-lg backdrop-blur-2xl backdrop-saturate-150">
             <span className="text-4xl" aria-hidden>
               ↗
             </span>
