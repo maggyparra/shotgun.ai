@@ -9,6 +9,10 @@
     "lint": "eslint"
   },
   "dependencies": {
+    "@lmnr-ai/lmnr": "^0.8.14",
+    "@react-google-maps/api": "^2.20.8",
+    "convex": "^1.32.0",
+    "lucide-react": "^0.575.0",
     "next": "16.1.6",
     "react": "19.2.3",
     "react-dom": "19.2.3"
