@@ -25,6 +25,10 @@ const defaultCenter = { lat: 37.7592, lng: -122.418 }
 const FOLLOW_ZOOM = 17
 /** Even slower simulation so you can read each step (~2.5s per point) */
 const SIMULATION_INTERVAL_MS = 2500
+/** Speed multiplier for simulation: 0.25 = slow, 1 = normal, 5 = fast. Effective interval = SIMULATION_INTERVAL_MS / multiplier. */
+const SIMULATION_SPEED_MIN = 0.25
+const SIMULATION_SPEED_MAX = 5
+const SIMULATION_SPEED_DEFAULT = 1
 const SEARCH_BAR_HEIGHT = 48
 
 const mapOptionsBase: google.maps.MapOptions = {
@@ -80,6 +84,66 @@ function pathSegmentDistance(
     d += distanceMeters(path[i], path[i + 1])
   }
   return d
+}
+
+/** Highway exit/merge: say which lane to get in when within this distance (1 km). */
+const LANE_CHIME_DISTANCE_M = 1000
+/** Within this many meters of the turn, say the "do it now" chime (e.g. "Turn left here"). Only one per maneuver. */
+const PROACTIVE_CHIME_AT_TURN_DISTANCE_M = 150
+/** Don't say "turn here" when closer than this—avoids speaking right as they're turning. */
+const PROACTIVE_CHIME_AT_TURN_MIN_DISTANCE_M = 50
+
+/** True if the step is for a major road (highway, merge, exit, ramp) where lane guidance matters. */
+function isMajorRoadStep(instructionText: string): boolean {
+  const t = instructionText.toLowerCase()
+  return (
+    /\b(merge|exit|ramp|interstate|highway|freeway)\b/.test(t) ||
+    /\bi-\d|\bus\s*\d|state\s*route|route\s+\d|hwy\s*\d/.test(t) ||
+    /\bkeep\s+(left|right)\b/.test(t)
+  )
+}
+
+function getChimePhrase(step: RouteStep): string {
+  const t = step.instructionText.toLowerCase()
+  if (isMajorRoadStep(step.instructionText)) {
+    const isExit = /\b(exit|ramp|take\s+exit)\b/.test(t)
+    const isMerge = /\bmerge\b/.test(t)
+    if (isExit) {
+      if (/left|take\s+the\s+left\s+exit/.test(t)) return "Take the left lane to exit."
+      if (/right|ramp|exit/.test(t)) return "Take the right lane to exit."
+      return "Take the right lane to exit."
+    }
+    if (isMerge) {
+      if (/right|merge\s+right/.test(t)) return "Take the right lane to merge."
+      if (/left|merge\s+left|keep\s+left/.test(t)) return "Take the left lane to merge."
+      return "Take the right lane to merge."
+    }
+    if (/right|keep\s+right/.test(t)) return "Get in the right lane for your next turn."
+    if (/left|keep\s+left/.test(t)) return "Get in the left lane for your next turn."
+    return "Get in position for your next turn."
+  }
+  if (/turn\s+left/.test(t)) return "Turn left here."
+  if (/turn\s+right/.test(t)) return "Turn right here."
+  if (/slight\s+left/.test(t)) return "Slight left here."
+  if (/slight\s+right/.test(t)) return "Slight right here."
+  return "Get ready for your next turn."
+}
+
+/** Short "do it now" phrase when very close to the turn (used for at-turn chime). */
+function getChimePhraseAtTurn(step: RouteStep): string {
+  const t = step.instructionText.toLowerCase()
+  if (isMajorRoadStep(step.instructionText)) {
+    const isExit = /\b(exit|ramp|take\s+exit)\b/.test(t)
+    const isMerge = /\bmerge\b/.test(t)
+    if (isExit) return "Take the exit now."
+    if (isMerge) return "Merge here."
+    return "Turn here."
+  }
+  if (/turn\s+left/.test(t)) return "Turn left here."
+  if (/turn\s+right/.test(t)) return "Turn right here."
+  if (/slight\s+left/.test(t)) return "Slight left here."
+  if (/slight\s+right/.test(t)) return "Slight right here."
+  return "Turn here."
 }
 
 function stripHtml(html: string): string {
@@ -199,6 +263,9 @@ export function MapDashboard() {
     navigationMode,
     updatePositionFromGps,
     routeVersion,
+    startPoint,
+    setStartPoint: setStartPointNav,
+    clearStartPoint,
   } = useNavigation()
   const [map, setMap] = useState<google.maps.Map | null>(null)
   const [mapCenter, setMapCenter] = useState(defaultCenter)
@@ -217,31 +284,53 @@ export function MapDashboard() {
   const [addingStop, setAddingStop] = useState(false)
   /** When true, next place selected = add stop during active navigation (re-route) */
   const [addingStopMidRoute, setAddingStopMidRoute] = useState(false)
+  /** When true, next place selected from search bar becomes route start (for "Start from" in panel). */
+  const [searchForStartLocation, setSearchForStartLocation] = useState(false)
+  /** Display label for custom start (e.g. address); when null, show "Current location". */
+  const [startPointAddress, setStartPointAddress] = useState<string | null>(null)
   const searchInputRef = useRef<HTMLInputElement>(null)
   const autocompleteRef = useRef<google.maps.places.Autocomplete | null>(null)
   const selectedDestRef = useRef(selectedDestination)
   const waypointsRef = useRef(waypoints)
   const addingStopRef = useRef(addingStop)
   const addingStopMidRouteRef = useRef(addingStopMidRoute)
-  /** Smooth car position: interpolated between path points for sliding animation */
+  const searchForStartRef = useRef(false)
+  /** Smooth car position: interpolated between path points for sliding animation (real mode only; simulation uses refs) */
   const [smoothCarPosition, setSmoothCarPosition] = useState<{ lat: number; lng: number } | null>(null)
+  /** Single location state for simulation; only source of truth. Updated at low frequency for POI/copilot; marker/camera use ref. */
+  const [simLocation, setSimLocation] = useState<{ lat: number; lng: number } | null>(null)
   const segmentStartTimeRef = useRef(0)
   const rafRef = useRef<number | null>(null)
+  /** Imperative blue-dot marker in simulation: created once, updated in RAF, never re-mounted. */
+  const carMarkerRef = useRef<google.maps.Marker | null>(null)
+  /** Current simulator position (RAF writes, no React state). Keeps dot centered and camera smooth. */
+  const simPositionRef = useRef<{ lat: number; lng: number } | null>(null)
+  /** Segment index for simulation; advanced in RAF to avoid re-renders. Synced to context via tickCar(). */
+  const simCarIndexRef = useRef(0)
+  /** Throttle: last time we pushed simLocation to state for POI/copilot (avoid re-renders every frame) */
+  const lastSimLocationStateUpdateRef = useRef(0)
   selectedDestRef.current = selectedDestination
   waypointsRef.current = waypoints
   addingStopRef.current = addingStop
   addingStopMidRouteRef.current = addingStopMidRoute
+  searchForStartRef.current = searchForStartLocation
   const pathRef = useRef(path)
   const destinationRef = useRef(destination)
   const carPositionRef = useRef(carPosition)
+  const carIndexRef = useRef(carIndex)
   const destinationNameRef = useRef(destinationName)
   pathRef.current = path
   destinationRef.current = destination
   carPositionRef.current = carPosition
+  carIndexRef.current = carIndex
   destinationNameRef.current = destinationName
   /** Exactly ONE route polyline on the map. Remove before creating a new one. */
   const currentRoutePolylineRef = useRef<google.maps.Polyline | null>(null)
   const [isSimulationPaused, setIsSimulationPaused] = useState(false)
+  /** 0.25 = slow, 1 = normal, 3 = fast. RAF uses SIMULATION_INTERVAL_MS / this value. */
+  const [simulationSpeed, setSimulationSpeed] = useState(SIMULATION_SPEED_DEFAULT)
+  const simulationSpeedRef = useRef(simulationSpeed)
+  simulationSpeedRef.current = simulationSpeed
   const [userLocation, setUserLocation] = useState<{
     lat: number
     lng: number
@@ -255,10 +344,36 @@ export function MapDashboard() {
   >([])
   /** When true, list is "add stop" options; tap or "pick first" adds as waypoint. When false, tap navigates to place. */
   const [searchResultsAddStopMode, setSearchResultsAddStopMode] = useState(false)
+  /** Simulated weather for demo (dynamic context: "steep curves may be slippery in rain"). */
+  const [weatherSim, setWeatherSim] = useState<"clear" | "rain" | "snow">("clear")
+  /** True when current route is the alternate (scenic) so copilot can say "this route is poorly lit". */
+  const [isAlternateRoute, setIsAlternateRoute] = useState(false)
+  /** When set, show modal to pick between two routes with tradeoff explainer. */
+  const [alternateRouteOptions, setAlternateRouteOptions] = useState<{
+    routeA: { path: { lat: number; lng: number }[]; steps: RouteStep[]; durationMinutes: number; distanceKm: number }
+    routeB: { path: { lat: number; lng: number }[]; steps: RouteStep[]; durationMinutes: number; distanceKm: number }
+    tradeoffA: string
+    tradeoffB: string
+    destinationName?: string
+    navigationMode?: "real" | "simulation"
+  } | null>(null)
   const tickRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const dragListenerRef = useRef<google.maps.MapsEventListener | null>(null)
   const lastPanTimeRef = useRef(0)
   const lastPanPositionRef = useRef<{ lat: number; lng: number } | null>(null)
+  const userLocationRef = useRef<{ lat: number; lng: number } | null>(null)
+  const zoomedToStartRef = useRef(false)
+  userLocationRef.current = userLocation
+  /** Set to true after we center the map on user location once on first load. Never center on GPS again after this. */
+  const hasSetInitialCenterRef = useRef(false)
+  /** Set to true as soon as we request (or get) initial location. GPS is then fully off — no more requests. */
+  const hasRequestedInitialLocationRef = useRef(false)
+  const mapRef = useRef<google.maps.Map | null>(null)
+  mapRef.current = map
+  const navigationModeRef = useRef(navigationMode)
+  navigationModeRef.current = navigationMode
+  /** In simulation we pass a single stable object so GoogleMap never re-applies center (stops flicker to origin). */
+  const simulationCenterStableRef = useRef<{ lat: number; lng: number }>({ ...defaultCenter })
 
   useEffect(() => {
     if (!isLoaded) return
@@ -266,49 +381,55 @@ export function MapDashboard() {
     return () => clearTimeout(t)
   }, [isLoaded])
 
+  // Get initial location once, then never use geolocation again (GPS fully off after this).
   useEffect(() => {
-    if (!mapReady || typeof navigator === "undefined" || !navigator.geolocation)
-      return
+    if (!mapReady || typeof navigator === "undefined" || !navigator.geolocation) return
+    if (hasRequestedInitialLocationRef.current) return
+    hasRequestedInitialLocationRef.current = true
     setUserLocationError(null)
-    const onPos = (pos: GeolocationPosition) => {
-      const { latitude, longitude, accuracy } = pos.coords
-      setUserLocation({
-        lat: latitude,
-        lng: longitude,
-        accuracy: accuracy ?? 50,
-      })
-      setMapCenter({ lat: latitude, lng: longitude })
-    }
     navigator.geolocation.getCurrentPosition(
-      onPos,
+      (pos) => {
+        const { latitude, longitude, accuracy } = pos.coords
+        setUserLocation({
+          lat: latitude,
+          lng: longitude,
+          accuracy: accuracy ?? 50,
+        })
+      },
       (err) => setUserLocationError(err.message),
       { enableHighAccuracy: true, timeout: 10000, maximumAge: 0 }
     )
-    const watchId = navigator.geolocation.watchPosition(
-      onPos,
-      () => {},
-      { enableHighAccuracy: true, maximumAge: 15000 }
-    )
-    return () => navigator.geolocation.clearWatch(watchId)
   }, [mapReady])
 
-  // Center map on user location as soon as we have it (when not in go mode)
+  // One-time only: center map on initial GPS location when we first have both map and userLocation. Never again after this. Skip if we're in active simulation.
   useEffect(() => {
-    if (!map || !userLocation || (isGoMode && path.length > 0)) return
+    if (!map || !userLocation || hasSetInitialCenterRef.current) return
+    if (isGoMode && navigationMode === "simulation") return
+    hasSetInitialCenterRef.current = true
     map.setCenter(userLocation)
     map.setZoom(FOLLOW_ZOOM)
     setMapCenter(userLocation)
-  }, [map, userLocation?.lat, userLocation?.lng, isGoMode, path.length])
+  }, [map, userLocation?.lat, userLocation?.lng, isGoMode, navigationMode])
 
-  // Real mode: update car position from GPS (snap to path)
+  // When navigation starts, zoom to the start of the route (like Google/Apple Maps). Skip in simulation — RAF owns the camera.
   useEffect(() => {
-    if (!isGoMode || path.length === 0 || navigationMode !== "real" || !userLocation) return
-    updatePositionFromGps(userLocation.lat, userLocation.lng)
-  }, [isGoMode, path.length, navigationMode, userLocation?.lat, userLocation?.lng, updatePositionFromGps])
+    if (!isGoMode || path.length === 0 || navigationMode === "simulation") {
+      zoomedToStartRef.current = false
+      return
+    }
+    if (zoomedToStartRef.current) return
+    const start = path[0]
+    if (!start || !map) return
+    zoomedToStartRef.current = true
+    setMapCenter(start)
+    map.panTo(start)
+    map.setZoom(FOLLOW_ZOOM)
+  }, [isGoMode, path, map, navigationMode])
 
   const onLoad = useCallback((mapInstance: google.maps.Map) => {
     setMap(mapInstance)
-    mapInstance.setCenter(defaultCenter)
+    const initialCenter = userLocationRef.current ?? defaultCenter
+    mapInstance.setCenter(initialCenter)
     mapInstance.setZoom(FOLLOW_ZOOM)
     if (typeof google !== "undefined" && google.maps?.event) {
       google.maps.event.trigger(mapInstance, "resize")
@@ -317,6 +438,7 @@ export function MapDashboard() {
       mapInstance,
       "dragend",
       () => {
+        if (navigationModeRef.current === "simulation") return
         const c = mapInstance.getCenter()
         if (c) setMapCenter({ lat: c.lat(), lng: c.lng() })
       }
@@ -325,8 +447,6 @@ export function MapDashboard() {
       if (typeof google !== "undefined" && google.maps?.event) {
         google.maps.event.trigger(mapInstance, "resize")
       }
-      mapInstance.setCenter(defaultCenter)
-      mapInstance.setZoom(FOLLOW_ZOOM)
     }, 400)
   }, [])
 
@@ -377,64 +497,123 @@ export function MapDashboard() {
     }
   }, [map, path, routeVersion])
 
+  // ——— Simulation: single imperative marker (create once, never re-mount) ———
+  useEffect(() => {
+    if (!map || !isGoMode || path.length === 0 || navigationMode !== "simulation") {
+      if (carMarkerRef.current) {
+        carMarkerRef.current.setMap(null)
+        carMarkerRef.current = null
+      }
+      return
+    }
+    const start = path[0] ?? defaultCenter
+    simulationCenterStableRef.current.lat = start.lat
+    simulationCenterStableRef.current.lng = start.lng
+    if (!carMarkerRef.current) {
+      carMarkerRef.current = new google.maps.Marker({
+        position: start,
+        map,
+        title: "Simulated location",
+        icon: {
+          path: google.maps.SymbolPath.CIRCLE,
+          scale: 12,
+          fillColor: "#007AFF",
+          fillOpacity: 1,
+          strokeColor: "#1e293b",
+          strokeWeight: 2,
+        },
+      })
+    } else {
+      carMarkerRef.current.setPosition(start)
+      carMarkerRef.current.setMap(map)
+    }
+    simCarIndexRef.current = 0
+    segmentStartTimeRef.current = Date.now()
+    simPositionRef.current = start
+    setSimLocation(start)
+    return () => {
+      if (carMarkerRef.current) {
+        carMarkerRef.current.setMap(null)
+        carMarkerRef.current = null
+      }
+    }
+  }, [map, isGoMode, path, navigationMode])
+
+  // ——— Simulation: single RAF loop — advance segment, update marker + camera only via refs (zero re-renders) ———
   useEffect(() => {
     if (!isGoMode || path.length === 0 || navigationMode !== "simulation") {
-      if (tickRef.current) {
-        clearInterval(tickRef.current)
-        tickRef.current = null
-      }
-      setSmoothCarPosition(null)
+      if (rafRef.current) cancelAnimationFrame(rafRef.current)
+      rafRef.current = null
       return
     }
     if (isSimulationPaused) {
-      if (tickRef.current) {
-        clearInterval(tickRef.current)
-        tickRef.current = null
+      if (rafRef.current) cancelAnimationFrame(rafRef.current)
+      rafRef.current = null
+      const idx = Math.min(carIndex, path.length - 1)
+      const pos = path[idx] ?? null
+      if (pos && carMarkerRef.current && mapRef.current) {
+        carMarkerRef.current.setPosition(pos)
+        mapRef.current.setCenter(pos)
+        mapRef.current.setZoom(FOLLOW_ZOOM)
       }
-      setSmoothCarPosition(path[carIndex] ?? null)
-      return
-    }
-    segmentStartTimeRef.current = Date.now()
-    setSmoothCarPosition(path[carIndex] ?? null)
-    tickRef.current = setInterval(tickCar, SIMULATION_INTERVAL_MS)
-    return () => {
-      if (tickRef.current) clearInterval(tickRef.current)
-    }
-  }, [isGoMode, path.length, tickCar, isSimulationPaused, carIndex, path, navigationMode])
-
-  // Smooth sliding: interpolate car position between path points every frame (only when not paused, simulation only)
-  useEffect(() => {
-    if (!isGoMode || path.length === 0 || navigationMode !== "simulation") return
-    if (isSimulationPaused) {
-      setSmoothCarPosition(path[carIndex] ?? null)
+      simPositionRef.current = pos
+      setSimLocation(pos)
       return
     }
     const animate = () => {
+      const pathSeg = pathRef.current
+      const idx = simCarIndexRef.current
       const now = Date.now()
       const elapsed = now - segmentStartTimeRef.current
-      const t = Math.min(1, elapsed / SIMULATION_INTERVAL_MS)
-      const idx = Math.min(carIndex, path.length - 1)
-      const nextIdx = Math.min(carIndex + 1, path.length - 1)
-      if (idx >= path.length - 1) {
-        setSmoothCarPosition(path[path.length - 1] ?? null)
+      const intervalMs = SIMULATION_INTERVAL_MS / Math.max(SIMULATION_SPEED_MIN, Math.min(SIMULATION_SPEED_MAX, simulationSpeedRef.current))
+      const t = Math.min(1, elapsed / intervalMs)
+      const i = Math.min(idx, pathSeg.length - 1)
+      const nextI = Math.min(idx + 1, pathSeg.length - 1)
+      let pos: { lat: number; lng: number }
+      if (i >= pathSeg.length - 1) {
+        pos = pathSeg[pathSeg.length - 1] ?? pathSeg[0] ?? defaultCenter
       } else {
-        setSmoothCarPosition(lerp(path[idx], path[nextIdx], t))
+        pos = lerp(pathSeg[i], pathSeg[nextI], t)
+      }
+      simPositionRef.current = pos
+      carMarkerRef.current?.setPosition(pos)
+      if (mapRef.current) {
+        mapRef.current.setCenter(pos)
+        mapRef.current.setZoom(FOLLOW_ZOOM)
+      }
+      if (t >= 1 && nextI < pathSeg.length) {
+        simCarIndexRef.current = nextI
+        segmentStartTimeRef.current = Date.now()
+        tickCar()
+      }
+      const tNow = Date.now()
+      if (tNow - lastSimLocationStateUpdateRef.current >= 500) {
+        lastSimLocationStateUpdateRef.current = tNow
+        setSimLocation(pos)
       }
       rafRef.current = requestAnimationFrame(animate)
     }
     rafRef.current = requestAnimationFrame(animate)
     return () => {
       if (rafRef.current) cancelAnimationFrame(rafRef.current)
+      rafRef.current = null
     }
-  }, [isGoMode, path, carIndex, isSimulationPaused, navigationMode])
+  }, [isGoMode, path.length, path, carIndex, isSimulationPaused, navigationMode, tickCar])
 
+  // Sync simCarIndexRef from context when path or carIndex changes (e.g. new route or external tick)
   useEffect(() => {
-    if (isGoMode && path.length > 0 && navigationMode === "simulation")
+    if (isGoMode && path.length > 0 && navigationMode === "simulation") {
+      simCarIndexRef.current = carIndex
       segmentStartTimeRef.current = Date.now()
+    } else {
+      setSimLocation(null)
+    }
   }, [carIndex, isGoMode, path.length, navigationMode])
 
-  // Nearby POIs for copilot — use dot position when in go mode (so simulation "me" = dot); throttle by ~10m to avoid refetch every frame
-  const positionForPOIs = isGoMode ? (smoothCarPosition ?? carPosition) : userLocation
+  // Nearby POIs for copilot — in simulation use only simLocation (single source); real mode uses smooth/car position
+  const positionForPOIs = isGoMode
+    ? (navigationMode === "simulation" ? simLocation : (smoothCarPosition ?? carPosition))
+    : userLocation
   const poiPositionKey =
     positionForPOIs != null
       ? `${Math.round(positionForPOIs.lat * 10000)}_${Math.round(positionForPOIs.lng * 10000)}`
@@ -464,20 +643,27 @@ export function MapDashboard() {
 
   useEffect(() => {
     if (!map || !isGoMode || path.length === 0 || isSimulationPaused) return
-    const pos =
-      navigationMode === "real"
-        ? carPosition
-        : (smoothCarPosition ?? carPosition)
+    // In simulation, center is driven only by the center prop (effectiveMapCenter); do not call panTo to avoid fighting with it and causing jitter.
+    if (navigationMode === "simulation") return
+    const pos = carPosition
     if (!pos) return
     const now = Date.now()
     const lastPos = lastPanPositionRef.current
     const distM = lastPos ? distanceMeters(lastPos, pos) : 999
-    if (lastPos && distM < 10 && now - lastPanTimeRef.current < 120) return
+    const throttle = lastPos && distM < 10 && now - lastPanTimeRef.current < 120
+    if (throttle) return
     lastPanTimeRef.current = now
     lastPanPositionRef.current = pos
     map.panTo(pos)
     map.setZoom(FOLLOW_ZOOM)
-  }, [map, isGoMode, smoothCarPosition, carPosition, path.length, isSimulationPaused, navigationMode])
+  }, [map, isGoMode, carPosition, path.length, isSimulationPaused, navigationMode])
+
+  const effectiveMapCenter =
+    isGoMode && path.length > 0
+      ? navigationMode === "simulation"
+        ? (path[0] ?? defaultCenter)
+        : (smoothCarPosition ?? carPosition ?? mapCenter)
+      : mapCenter
 
   // Google Places Autocomplete on search input (re-attach when search bar is visible)
   const showSearchBar = !isGoMode || addingStopMidRoute
@@ -496,12 +682,26 @@ export function MapDashboard() {
       const lat = loc.lat()
       const lng = loc.lng()
       const address = place.formatted_address || place.name || `${lat.toFixed(5)}, ${lng.toFixed(5)}`
+      if (searchForStartRef.current) {
+        setStartPointNav(lat, lng)
+        setStartPointAddress(address)
+        setSearchForStartLocation(false)
+        input.value = ""
+        const dest = selectedDestRef.current
+        if (dest) {
+          fetchRouteAndSetPanel({ lat, lng }, { lat: dest.lat, lng: dest.lng }, dest.address, waypointsRef.current)
+        }
+        return
+      }
       const isAddingStop = addingStopRef.current
       const isMidRoute = addingStopMidRouteRef.current
       if (isMidRoute) {
         input.value = ""
         setAddingStopMidRoute(false)
-        const origin = carPositionRef.current ?? pathRef.current[0] ?? userLocation ?? defaultCenter
+        const origin =
+          navigationModeRef.current === "simulation"
+            ? (simPositionRef.current ?? pathRef.current[0] ?? defaultCenter)
+            : (carPositionRef.current ?? pathRef.current[0] ?? userLocation ?? defaultCenter)
         const dest = destinationRef.current ?? pathRef.current[pathRef.current.length - 1]
         if (!dest) return
         if (typeof google !== "undefined" && google.maps?.DirectionsService) {
@@ -531,7 +731,7 @@ export function MapDashboard() {
         setWaypoints(newWaypoints)
         input.value = ""
         setAddingStop(false)
-        const origin = userLocation ?? defaultCenter
+        const origin = startPoint ?? userLocation ?? defaultCenter
         const dest = selectedDestRef.current
         if (dest) {
           fetchRouteAndSetPanel(origin, { lat: dest.lat, lng: dest.lng }, dest.address, newWaypoints)
@@ -546,7 +746,7 @@ export function MapDashboard() {
         })
         setWaypoints([])
         input.value = ""
-        fetchRouteAndSetPanel(userLocation ?? defaultCenter, { lat, lng }, address, [])
+        fetchRouteAndSetPanel(startPoint ?? userLocation ?? defaultCenter, { lat, lng }, address, [])
       }
     })
     autocompleteRef.current = ac
@@ -554,7 +754,7 @@ export function MapDashboard() {
       google.maps.event.removeListener(listener)
       autocompleteRef.current = null
     }
-  }, [isLoaded, mapReady, showSearchBar, navigationMode, startNavigationWithPath])
+  }, [isLoaded, mapReady, showSearchBar, navigationMode, startNavigationWithPath, startPoint])
 
   function fetchRouteAndSetPanel(
     origin: { lat: number; lng: number },
@@ -605,22 +805,61 @@ export function MapDashboard() {
     )
   }
 
-  const mapOptions: google.maps.MapOptions = {
-    ...mapOptionsBase,
-    center: mapCenter,
-  }
+  const mapOptions: google.maps.MapOptions =
+    isGoMode && path.length > 0 && navigationMode === "simulation"
+      ? { ...mapOptionsBase }
+      : { ...mapOptionsBase, center: mapCenter }
 
+  /** Use position-based index so chime and current step reflect sim position (updates with simLocation every 500ms). */
+  const effectiveIndexForChime =
+    isGoMode && path.length > 0
+      ? navigationMode === "simulation" && (simLocation ?? path[0])
+        ? closestPathIndex(path, (simLocation ?? path[0]).lat, (simLocation ?? path[0]).lng)
+        : carIndex
+      : 0
   const nextStep: RouteStep | null =
-    routeSteps.find((s) => s.pathIndex > carIndex) ?? null
+    routeSteps.find((s) => s.pathIndex > effectiveIndexForChime) ?? null
   const distanceToNextTurn =
     nextStep != null
-      ? pathSegmentDistance(path, carIndex, nextStep.pathIndex)
+      ? pathSegmentDistance(path, effectiveIndexForChime, nextStep.pathIndex)
       : null
   const arrived = carIndex >= path.length - 1
 
+  /** Proactive chime: only for highway exit/merge—"Get in the right/left lane to exit/merge" when within 1 km. One per step. */
+  const proactiveChimeText =
+    isGoMode &&
+    path.length > 0 &&
+    nextStep &&
+    distanceToNextTurn != null &&
+    distanceToNextTurn <= LANE_CHIME_DISTANCE_M &&
+    isMajorRoadStep(nextStep.instructionText)
+      ? getChimePhrase(nextStep)
+      : null
+  const proactiveChimePathIndex =
+    proactiveChimeText ? nextStep!.pathIndex : null
+  /** "Turn left here" / "Take the exit now" when 50–150m from the turn; one per maneuver. Not when closer (avoids speaking while turning). */
+  const proactiveChimeAtTurnText =
+    isGoMode &&
+    path.length > 0 &&
+    nextStep &&
+    distanceToNextTurn != null &&
+    distanceToNextTurn >= PROACTIVE_CHIME_AT_TURN_MIN_DISTANCE_M &&
+    distanceToNextTurn <= PROACTIVE_CHIME_AT_TURN_DISTANCE_M
+      ? getChimePhraseAtTurn(nextStep)
+      : null
+  const proactiveChimeAtTurnPathIndex =
+    proactiveChimeAtTurnText ? nextStep!.pathIndex : null
+
+  /** Current step = step that contains our position (largest pathIndex <= effective index). Avoids always returning the first step (20th St). */
+  const effectiveIndexForCurrentStep = isGoMode && path.length > 0 ? effectiveIndexForChime : carIndex
   const currentStepText =
-    routeSteps.find((s) => s.pathIndex <= carIndex)?.instructionText ?? undefined
-  const positionForContext = smoothCarPosition ?? carPosition ?? userLocation ?? defaultCenter
+    (routeSteps
+      .filter((s) => s.pathIndex <= effectiveIndexForCurrentStep)
+      .reduce<RouteStep | null>((best, s) => (best === null || s.pathIndex >= best.pathIndex ? s : best), null)
+      ?.instructionText) ?? undefined
+  const positionForContext = navigationMode === "simulation"
+    ? (simLocation ?? path[0] ?? defaultCenter)
+    : (smoothCarPosition ?? carPosition ?? userLocation ?? defaultCenter)
   const posAsCoord = positionForContext as { lat: number; lng: number }
   const heading =
     isGoMode && path.length > 1
@@ -647,17 +886,30 @@ export function MapDashboard() {
     destination: destination ?? (path.length > 0 ? path[path.length - 1] ?? undefined : undefined),
     currentStepText,
     nextStepText: nextStep?.instructionText,
+    distanceToNextTurnMeters: distanceToNextTurn ?? null,
     destinationName: destinationName ?? undefined,
     hasActiveRoute: isGoMode && path.length > 0,
     navigationMode: isGoMode ? navigationMode : undefined,
     heading,
     nearbyPOIs: nearbyPOIsWithSide.length > 0 ? nearbyPOIsWithSide : undefined,
     addStopOptions: searchResultsAddStopMode && searchNearbyResults.length > 0 ? searchNearbyResults : undefined,
+    timeOfDay: (() => {
+      const h = typeof window !== "undefined" ? new Date().getHours() : 12
+      if (h >= 5 && h < 12) return "morning"
+      if (h >= 12 && h < 17) return "afternoon"
+      if (h >= 17 && h < 21) return "evening"
+      return "night"
+    })(),
+    weatherSim: weatherSim !== "clear" ? weatherSim : undefined,
+    isAlternateRoute: isGoMode && isAlternateRoute,
   }
 
   const handleAddStopWithQuery = useCallback(
     (query: string, _maxMinutesAdded?: number, _maxMinutesFromNow?: number) => {
-      const origin = smoothCarPosition ?? carPosition ?? userLocation ?? defaultCenter
+      const origin =
+        navigationMode === "simulation"
+          ? (simLocation ?? path[0] ?? defaultCenter)
+          : (smoothCarPosition ?? carPosition ?? userLocation ?? defaultCenter)
       const openSearchWithQuery = (forMidRoute: boolean) => {
         if (forMidRoute) setAddingStopMidRoute(true)
         else setAddingStop(true)
@@ -676,24 +928,29 @@ export function MapDashboard() {
           openSearchWithQuery(isGoMode)
           return
         }
-        setSearchNearbyResults(
-          results.slice(0, 8).map((p) => ({
-            name: p.name ?? "Unnamed",
-            address: p.formatted_address,
-            lat: p.geometry?.location?.lat() ?? 0,
-            lng: p.geometry?.location?.lng() ?? 0,
-          }))
+        const withCoords = results.slice(0, 8).map((p) => ({
+          name: p.name ?? "Unnamed",
+          address: p.formatted_address,
+          lat: p.geometry?.location?.lat() ?? 0,
+          lng: p.geometry?.location?.lng() ?? 0,
+        }))
+        const sorted = [...withCoords].sort(
+          (a, b) => distanceMeters(origin, a) - distanceMeters(origin, b)
         )
+        setSearchNearbyResults(sorted)
         setSearchResultsAddStopMode(true)
       })
     },
-    [map, isGoMode, smoothCarPosition, carPosition, userLocation]
+    [map, isGoMode, path, navigationMode, simLocation, smoothCarPosition, carPosition, userLocation]
   )
 
   /** Add a place as a waypoint: re-route through it (when navigating) or add to waypoints and refresh route (when planning). */
   const addPlaceAsStop = useCallback(
     (place: { name: string; address?: string; lat: number; lng: number }) => {
-      const origin = smoothCarPosition ?? carPosition ?? userLocation ?? defaultCenter
+      const origin =
+        navigationMode === "simulation"
+          ? (simLocation ?? path[0] ?? defaultCenter)
+          : (smoothCarPosition ?? carPosition ?? userLocation ?? defaultCenter)
       const dest = destination ?? (path.length > 0 ? path[path.length - 1] : null)
       setSearchNearbyResults([])
       setSearchResultsAddStopMode(false)
@@ -712,6 +969,7 @@ export function MapDashboard() {
             const { pathLatLng, steps, waypoints: waypointsFromLegs } = buildPathStepsAndWaypointsFromRoute(result.routes[0])
             setIsSimulationPaused(false)
             startNavigationWithPath(pathLatLng, destinationName ?? undefined, steps, navigationMode, waypointsFromLegs)
+            setIsAlternateRoute(false)
             setSelectedDestination(null)
             setWaypoints([])
           }
@@ -736,42 +994,145 @@ export function MapDashboard() {
     [searchResultsAddStopMode, searchNearbyResults, addPlaceAsStop]
   )
 
+  /** Add a specific place as a stop immediately (e.g. voice: "choose one that has diesel" → Royal Gas). */
+  const handleAddStopPlace = useCallback(
+    (name: string, address: string, lat: number, lng: number) => {
+      addPlaceAsStop({ name, address, lat, lng })
+    },
+    [addPlaceAsStop]
+  )
+
+  /** Show the add-stop list with exactly these places (e.g. Royal Gas, Shell, ARCO near Palega). */
+  const handleShowAddStopOptions = useCallback(
+    (places: { name: string; address?: string; lat: number; lng: number }[]) => {
+      setSearchNearbyResults(places)
+      setSearchResultsAddStopMode(true)
+    },
+    []
+  )
+
   const handleRequestAlternateRoute = useCallback(() => {
-    const origin = smoothCarPosition ?? carPosition ?? userLocation ?? defaultCenter
+    const origin =
+      navigationMode === "simulation"
+        ? (simLocation ?? path[0] ?? defaultCenter)
+        : (smoothCarPosition ?? carPosition ?? userLocation ?? defaultCenter)
     const dest = destination ?? (path.length > 0 ? path[path.length - 1] : null)
     if (!dest || typeof google === "undefined" || !google.maps?.DirectionsService) return
     const ds = new google.maps.DirectionsService()
-    ds.route(
-      {
-        origin: new google.maps.LatLng(origin.lat, origin.lng),
-        destination: new google.maps.LatLng(dest.lat, dest.lng),
-        travelMode: google.maps.TravelMode.DRIVING,
-        provideRouteAlternatives: true,
-      },
-      (result, status) => {
-        if (status !== "OK" || !result?.routes?.length || result.routes.length < 2) return
-        const alt = result.routes[1]
-        const pathLatLng = alt.overview_path.map((p: google.maps.LatLng) => ({ lat: p.lat(), lng: p.lng() }))
-        const legs = alt.legs ?? []
-        const steps: RouteStep[] = []
-        legs.forEach((leg: google.maps.DirectionsLeg) => {
-          ;(leg.steps ?? []).forEach((s: google.maps.DirectionsStep) => {
-            steps.push({
-              instructionText: s.instructions ? stripHtml(s.instructions) : "Continue",
-              pathIndex: s.start_location
-                ? closestPathIndex(pathLatLng, s.start_location.lat(), s.start_location.lng())
-                : 0,
-            })
+    const originLatLng = new google.maps.LatLng(origin.lat, origin.lng)
+    const destLatLng = new google.maps.LatLng(dest.lat, dest.lng)
+    const buildSteps = (route: google.maps.DirectionsRoute, pathLatLng: { lat: number; lng: number }[]) => {
+      const steps: RouteStep[] = []
+      ;(route.legs ?? []).forEach((leg: google.maps.DirectionsLeg) => {
+        ;(leg.steps ?? []).forEach((s: google.maps.DirectionsStep) => {
+          steps.push({
+            instructionText: s.instructions ? stripHtml(s.instructions) : "Continue",
+            pathIndex: s.start_location
+              ? closestPathIndex(pathLatLng, s.start_location.lat(), s.start_location.lng())
+              : 0,
           })
         })
-        startNavigationWithPath(pathLatLng, destinationName ?? undefined, steps, navigationMode)
+      })
+      return steps
+    }
+    const durDist = (route: google.maps.DirectionsRoute) => {
+      let dur = 0
+      let dist = 0
+      ;(route.legs ?? []).forEach((leg: google.maps.DirectionsLeg) => {
+        dur += leg.duration?.value ?? 0
+        dist += leg.distance?.value ?? 0
+      })
+      return { durationMinutes: Math.ceil(dur / 60), distanceKm: (dist / 1000).toFixed(1) }
+    }
+    const applyAlternates = async (r0: google.maps.DirectionsRoute | null, r1: google.maps.DirectionsRoute | null) => {
+      if (!r0?.overview_path?.length) return
+      const pathA = r0.overview_path.map((p: google.maps.LatLng) => ({ lat: p.lat(), lng: p.lng() }))
+      const stepsA = buildSteps(r0, pathA)
+      const dA = durDist(r0)
+      if (r1?.overview_path?.length) {
+        const pathB = r1.overview_path.map((p: google.maps.LatLng) => ({ lat: p.lat(), lng: p.lng() }))
+        const stepsB = buildSteps(r1, pathB)
+        const dB = durDist(r1)
+        try {
+          const tradeoffRes = await fetch("/api/route-tradeoff", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              routeA: { durationMinutes: dA.durationMinutes, distanceKm: dA.distanceKm },
+              routeB: { durationMinutes: dB.durationMinutes, distanceKm: dB.distanceKm },
+              vibeA: "Fastest",
+              vibeB: "Scenic",
+            }),
+          })
+          const { tradeoffA, tradeoffB } = (await tradeoffRes.json()) as { tradeoffA: string; tradeoffB: string }
+          setAlternateRouteOptions({
+            routeA: { path: pathA, steps: stepsA, durationMinutes: dA.durationMinutes, distanceKm: parseFloat(dA.distanceKm) },
+            routeB: { path: pathB, steps: stepsB, durationMinutes: dB.durationMinutes, distanceKm: parseFloat(dB.distanceKm) },
+            tradeoffA: tradeoffA ?? "Faster route.",
+            tradeoffB: tradeoffB ?? "Scenic alternate.",
+            destinationName: destinationName ?? undefined,
+            navigationMode,
+          })
+        } catch {
+          setAlternateRouteOptions({
+            routeA: { path: pathA, steps: stepsA, durationMinutes: dA.durationMinutes, distanceKm: parseFloat(dA.distanceKm) },
+            routeB: { path: pathB, steps: stepsB, durationMinutes: dB.durationMinutes, distanceKm: parseFloat(dB.distanceKm) },
+            tradeoffA: "Faster route.",
+            tradeoffB: "Scenic alternate with different roads.",
+            destinationName: destinationName ?? undefined,
+            navigationMode,
+          })
+        }
+      } else {
+        ds.route(
+          { origin: originLatLng, destination: destLatLng, travelMode: google.maps.TravelMode.DRIVING, provideRouteAlternatives: true },
+          (altResult, altStatus) => {
+            if (altStatus === "OK" && altResult?.routes?.length >= 2 && altResult.routes[1]?.overview_path?.length) {
+              const r1 = altResult.routes[1]
+              const pathB = r1.overview_path!.map((p: google.maps.LatLng) => ({ lat: p.lat(), lng: p.lng() }))
+              const stepsB = buildSteps(r1, pathB)
+              const dB = durDist(r1)
+              setAlternateRouteOptions({
+                routeA: { path: pathA, steps: stepsA, durationMinutes: dA.durationMinutes, distanceKm: parseFloat(dA.distanceKm) },
+                routeB: { path: pathB, steps: stepsB, durationMinutes: dB.durationMinutes, distanceKm: parseFloat(dB.distanceKm) },
+                tradeoffA: "Faster route.",
+                tradeoffB: "Scenic alternate with different roads.",
+                destinationName: destinationName ?? undefined,
+                navigationMode,
+              })
+            }
+          }
+        )
+      }
+    }
+    ds.route(
+      { origin: originLatLng, destination: destLatLng, travelMode: google.maps.TravelMode.DRIVING },
+      (resultA, statusA) => {
+        if (statusA !== "OK" || !resultA?.routes?.[0]?.overview_path?.length) return
+        const r0 = resultA.routes[0]
+        ds.route(
+          {
+            origin: originLatLng,
+            destination: destLatLng,
+            travelMode: google.maps.TravelMode.DRIVING,
+            avoid: ["highways"],
+          },
+          (resultB, statusB) => {
+            const r1 = statusB === "OK" && resultB?.routes?.[0]?.overview_path?.length ? resultB.routes[0] : null
+            applyAlternates(r0, r1)
+          }
+        )
       }
     )
-  }, [smoothCarPosition, carPosition, userLocation, destination, path, destinationName, startNavigationWithPath, navigationMode])
+  }, [destination, path, destinationName, startNavigationWithPath, navigationMode, simLocation, smoothCarPosition, carPosition, userLocation])
 
   const handleNavigateTo = useCallback(
     (query: string) => {
-      const origin = userLocation ?? defaultCenter
+      const origin = isGoMode
+        ? (navigationMode === "simulation"
+            ? (simLocation ?? path[0] ?? defaultCenter)
+            : (smoothCarPosition ?? carPosition ?? userLocation ?? defaultCenter))
+        : (userLocation ?? defaultCenter)
       if (!map || typeof google === "undefined" || !google.maps?.places || !google.maps?.DirectionsService) return
       const places = new google.maps.places.PlacesService(map)
       const loc = new google.maps.LatLng(origin.lat, origin.lng)
@@ -782,23 +1143,25 @@ export function MapDashboard() {
         const lng = p.geometry?.location?.lng()
         if (lat == null || lng == null) return
         const destName = p.name ?? p.formatted_address ?? `${lat.toFixed(5)}, ${lng.toFixed(5)}`
+        const routeOrigin = startPoint ?? userLocation ?? defaultCenter
         const ds = new google.maps.DirectionsService()
         ds.route(
           {
-            origin: new google.maps.LatLng(origin.lat, origin.lng),
+            origin: new google.maps.LatLng(routeOrigin.lat, routeOrigin.lng),
             destination: new google.maps.LatLng(lat, lng),
             travelMode: google.maps.TravelMode.DRIVING,
           },
           (result, routeStatus) => {
             if (routeStatus !== "OK" || !result?.routes?.[0]?.overview_path?.length) return
+            const leg = result.routes[0].legs?.[0]
             const pathLatLng = result.routes[0].overview_path.map((pt: google.maps.LatLng) => ({
               lat: pt.lat(),
               lng: pt.lng(),
             }))
             const legs = result.routes[0].legs ?? []
             const steps: RouteStep[] = []
-            legs.forEach((leg: google.maps.DirectionsLeg) => {
-              ;(leg.steps ?? []).forEach((s: google.maps.DirectionsStep) => {
+            legs.forEach((legItem: google.maps.DirectionsLeg) => {
+              ;(legItem.steps ?? []).forEach((s: google.maps.DirectionsStep) => {
                 steps.push({
                   instructionText: s.instructions ? stripHtml(s.instructions) : "Continue",
                   pathIndex: s.start_location
@@ -807,19 +1170,32 @@ export function MapDashboard() {
                 })
               })
             })
-            setIsSimulationPaused(false)
-            startNavigationWithPath(pathLatLng, destName, steps, "real")
+            const durationMinutes = leg?.duration?.value ? Math.ceil(leg.duration.value / 60) : 0
+            const stepsText = (leg?.steps ?? [])
+              .map((s: google.maps.DirectionsStep) => (s.instructions ? stripHtml(s.instructions) : ""))
+              .filter(Boolean)
+            setSelectedDestination({
+              lat,
+              lng,
+              address: destName,
+              durationMinutes,
+              steps: stepsText,
+            })
           }
         )
       })
     },
-    [map, userLocation, startNavigationWithPath]
+    [map, userLocation, startNavigationWithPath, isGoMode, smoothCarPosition, carPosition, startPoint]
   )
 
   /** Navigate to a specific place by coords (e.g. after user picks from search_nearby results). */
   const handleNavigateToPlace = useCallback(
     (lat: number, lng: number, destName: string) => {
-      const origin = userLocation ?? defaultCenter
+      const origin = isGoMode
+        ? (navigationMode === "simulation"
+            ? (simLocation ?? path[0] ?? defaultCenter)
+            : (smoothCarPosition ?? carPosition ?? userLocation ?? defaultCenter))
+        : (userLocation ?? defaultCenter)
       if (!map || typeof google === "undefined" || !google.maps?.DirectionsService) return
       const ds = new google.maps.DirectionsService()
       ds.route(
@@ -849,17 +1225,22 @@ export function MapDashboard() {
           setSearchNearbyResults([])
           setIsSimulationPaused(false)
           startNavigationWithPath(pathLatLng, destName, steps, "real")
+          setIsAlternateRoute(false)
         }
       )
     },
-    [map, userLocation, startNavigationWithPath]
+    [map, userLocation, startNavigationWithPath, isGoMode, smoothCarPosition, carPosition]
   )
 
   /** "Vegetarian options near me" etc.: run Places search near user, show results for user to pick. */
   const handleSearchNearby = useCallback(
     (query: string) => {
       setSearchResultsAddStopMode(false)
-      const origin = userLocation ?? defaultCenter
+      const origin = isGoMode
+        ? (navigationMode === "simulation"
+            ? (simLocation ?? path[0] ?? defaultCenter)
+            : (smoothCarPosition ?? carPosition ?? userLocation ?? defaultCenter))
+        : (userLocation ?? defaultCenter)
       if (!map || typeof google === "undefined" || !google.maps?.places) return
       const places = new google.maps.places.PlacesService(map)
       const loc = new google.maps.LatLng(origin.lat, origin.lng)
@@ -878,7 +1259,7 @@ export function MapDashboard() {
         )
       })
     },
-    [map, userLocation]
+    [map, userLocation, isGoMode, smoothCarPosition, carPosition]
   )
 
   if (loadError) {
@@ -907,7 +1288,7 @@ export function MapDashboard() {
 
   return (
     <div
-      className="relative w-full bg-zinc-950"
+      className="relative w-full overflow-visible bg-zinc-950"
       style={{
         height: "100vh",
         minHeight: 400,
@@ -925,7 +1306,9 @@ export function MapDashboard() {
             ref={searchInputRef}
             type="text"
             placeholder={
-              addingStopMidRoute
+              searchForStartLocation
+                ? "Search start location..."
+                : addingStopMidRoute
                 ? "Search for a place to add (you’ll go there next)..."
                 : addingStop
                   ? "Search for a place to add as stop..."
@@ -934,12 +1317,13 @@ export function MapDashboard() {
             className="flex-1 rounded-lg border border-zinc-600 bg-zinc-800 px-3 py-2.5 text-sm text-zinc-100 placeholder-zinc-500 focus:border-cyan-500 focus:outline-none focus:ring-1 focus:ring-cyan-500"
             aria-label="Search destination or place"
           />
-          {(addingStop || addingStopMidRoute) && (
+          {(addingStop || addingStopMidRoute || searchForStartLocation) && (
             <button
               type="button"
               onClick={() => {
                 setAddingStop(false)
                 setAddingStopMidRoute(false)
+                setSearchForStartLocation(false)
               }}
               className="shrink-0 rounded-lg bg-zinc-700 px-3 py-2 text-xs font-medium text-zinc-300 hover:bg-zinc-600"
             >
@@ -993,7 +1377,11 @@ export function MapDashboard() {
                 ? "calc(100vh - 64px)"
                 : "100vh",
           }}
-          center={mapCenter}
+          center={
+            isGoMode && path.length > 0 && navigationMode === "simulation"
+              ? undefined
+              : effectiveMapCenter
+          }
           zoom={FOLLOW_ZOOM}
           onLoad={onLoad}
           onUnmount={onUnmount}
@@ -1001,7 +1389,7 @@ export function MapDashboard() {
             if (e.latLng) {
               const lat = e.latLng.lat()
               const lng = e.latLng.lng()
-              const origin = userLocation ?? defaultCenter
+              const origin = startPoint ?? userLocation ?? defaultCenter
               const updateAddress = (addr: string) => {
                 setSelectedDestination((prev) =>
                   prev && prev.lat === lat && prev.lng === lng
@@ -1134,18 +1522,14 @@ export function MapDashboard() {
               />
             </>
           )}
-          {isGoMode && (carPosition || smoothCarPosition) && (
+          {isGoMode && navigationMode === "real" && carPosition && (
             <Marker
-              position={
-                navigationMode === "real"
-                  ? (carPosition ?? defaultCenter)
-                  : (smoothCarPosition ?? carPosition ?? defaultCenter)
-              }
-              title={navigationMode === "real" ? "Your location" : "Simulated location"}
+              position={carPosition}
+              title="Your location"
               icon={{
                 path: google.maps.SymbolPath.CIRCLE,
                 scale: 12,
-                fillColor: navigationMode === "real" ? "#007AFF" : "#facc15",
+                fillColor: "#007AFF",
                 fillOpacity: 1,
                 strokeColor: "#1e293b",
                 strokeWeight: 2,
@@ -1184,7 +1568,7 @@ export function MapDashboard() {
       </div>
 
       {selectedDestination && !isGoMode && (
-        <div className="absolute bottom-0 left-0 right-0 z-10 max-h-[55vh] overflow-y-auto rounded-t-2xl border border-zinc-700 bg-zinc-900 px-4 py-4 shadow-[0_-4px_20px_rgba(0,0,0,0.4)]">
+        <div className="absolute bottom-0 left-0 right-0 z-20 max-h-[55vh] overflow-y-auto rounded-t-2xl border border-zinc-700 bg-zinc-900 px-4 py-4 shadow-[0_-4px_20px_rgba(0,0,0,0.4)]">
           <p className="font-semibold text-zinc-100">
             {selectedDestination.address}
           </p>
@@ -1193,6 +1577,43 @@ export function MapDashboard() {
               ? `~${selectedDestination.durationMinutes} min total`
               : "Getting route…"}
           </p>
+
+          <div className="mt-3 flex flex-wrap items-center gap-2 border-t border-zinc-700 pt-3">
+            <span className="text-xs text-zinc-500">Start from:</span>
+            <span className="text-sm text-zinc-300">
+              {startPointAddress ?? "Current location"}
+            </span>
+            <button
+              type="button"
+              onClick={() => {
+                setSearchForStartLocation(true)
+                setTimeout(() => searchInputRef.current?.focus(), 100)
+              }}
+              className="rounded bg-zinc-700 px-2 py-1 text-xs font-medium text-zinc-200 hover:bg-zinc-600"
+            >
+              Change
+            </button>
+            {startPoint && (
+              <button
+                type="button"
+                onClick={() => {
+                  clearStartPoint()
+                  setStartPointAddress(null)
+                  if (selectedDestination) {
+                    fetchRouteAndSetPanel(
+                      userLocation ?? defaultCenter,
+                      { lat: selectedDestination.lat, lng: selectedDestination.lng },
+                      selectedDestination.address,
+                      waypoints
+                    )
+                  }
+                }}
+                className="rounded bg-zinc-700 px-2 py-1 text-xs font-medium text-zinc-200 hover:bg-zinc-600"
+              >
+                Use current location
+              </button>
+            )}
+          </div>
 
           {/* Stops with distance and time added */}
           {waypoints.length > 0 && selectedDestination.legInfo && (
@@ -1261,12 +1682,13 @@ export function MapDashboard() {
             <button
               type="button"
               onClick={() => {
-                const origin = userLocation ?? defaultCenter
+                const origin = startPoint ?? userLocation ?? defaultCenter
                 const dest = {
                   lat: selectedDestination.lat,
                   lng: selectedDestination.lng,
                 }
                 const destName = selectedDestination.address
+                setIsAlternateRoute(false)
                 const runNav = (mode: "real" | "simulation") => {
                   if (
                     typeof google !== "undefined" &&
@@ -1316,12 +1738,13 @@ export function MapDashboard() {
             <button
               type="button"
               onClick={() => {
-                const origin = userLocation ?? defaultCenter
+                const origin = startPoint ?? userLocation ?? defaultCenter
                 const dest = {
                   lat: selectedDestination.lat,
                   lng: selectedDestination.lng,
                 }
                 const destName = selectedDestination.address
+                setIsAlternateRoute(false)
                 const runNav = (mode: "real" | "simulation") => {
                   if (
                     typeof google !== "undefined" &&
@@ -1373,7 +1796,10 @@ export function MapDashboard() {
       )}
 
       {isGoMode && path.length > 0 && (
-        <div className="absolute bottom-0 left-0 right-0 z-10 flex items-center justify-between gap-4 rounded-t-2xl border-t border-zinc-200 bg-white pl-8 pr-4 py-4 shadow-[0_-4px_20px_rgba(0,0,0,0.15)] dark:border-zinc-700 dark:bg-zinc-900">
+        <div
+          className="absolute left-0 right-0 z-[90] flex items-center justify-between gap-4 rounded-t-2xl border-t border-zinc-200 bg-white pl-8 pr-4 py-4 shadow-[0_-4px_20px_rgba(0,0,0,0.15)] dark:border-zinc-700 dark:bg-zinc-900"
+          style={{ paddingBottom: "max(1rem, env(safe-area-inset-bottom))" }}
+        >
           <div className="min-w-0 flex-1">
             <p className="font-semibold text-zinc-900 dark:text-zinc-100">
               {arrived
@@ -1398,7 +1824,24 @@ export function MapDashboard() {
             Add stop
           </button>
           {navigationMode === "simulation" && (
-            <button
+            <>
+              <div className="flex shrink-0 items-center gap-2">
+                <span className="text-xs text-zinc-500 dark:text-zinc-400" title="Simulation speed">Speed</span>
+                <input
+                  type="range"
+                  min={SIMULATION_SPEED_MIN}
+                  max={SIMULATION_SPEED_MAX}
+                  step={0.25}
+                  value={simulationSpeed}
+                  onChange={(e) => setSimulationSpeed(parseFloat(e.target.value))}
+                  className="h-2 w-20 accent-cyan-500 dark:accent-cyan-400"
+                  aria-label="Simulation speed"
+                />
+                <span className="min-w-[2.5rem] text-xs text-zinc-400 dark:text-zinc-500">
+                  {simulationSpeed === 1 ? "1×" : `${simulationSpeed}×`}
+                </span>
+              </div>
+              <button
               type="button"
               onClick={() => setIsSimulationPaused((p) => !p)}
               className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-zinc-200 text-zinc-700 hover:bg-zinc-300 dark:bg-zinc-700 dark:text-zinc-200 dark:hover:bg-zinc-600"
@@ -1410,6 +1853,7 @@ export function MapDashboard() {
                 <span className="text-lg" aria-hidden>⏸</span>
               )}
             </button>
+            </>
           )}
           <button
             type="button"
@@ -1479,12 +1923,93 @@ export function MapDashboard() {
 
       <VoiceCopilot
         context={copilotContext}
+        proactiveChimeText={proactiveChimeText}
+        proactiveChimePathIndex={proactiveChimePathIndex}
+        proactiveChimeAtTurnText={proactiveChimeAtTurnText}
+        proactiveChimeAtTurnPathIndex={proactiveChimeAtTurnPathIndex}
         onAddStopWithQuery={handleAddStopWithQuery}
+        onAddStopPlace={handleAddStopPlace}
         onRequestAlternateRoute={handleRequestAlternateRoute}
         onNavigateTo={handleNavigateTo}
         onSearchNearby={handleSearchNearby}
+        onShowAddStopOptions={handleShowAddStopOptions}
         onPickOption={handlePickOption}
       />
+
+      {/* Alternate route picker with tradeoff explainer */}
+      {alternateRouteOptions && (
+        <div className="absolute inset-0 z-30 flex items-center justify-center bg-black/60 p-4" role="dialog" aria-label="Choose route">
+          <div className="w-full max-w-md rounded-2xl border border-zinc-600 bg-zinc-900 p-5 shadow-xl">
+            <h3 className="mb-3 text-lg font-semibold text-zinc-100">Choose your route</h3>
+            <p className="mb-4 text-sm text-zinc-400">Pick one — Shotgun explains the tradeoff.</p>
+            <div className="space-y-3">
+              <button
+                type="button"
+                onClick={() => {
+                  startNavigationWithPath(
+                    alternateRouteOptions.routeA.path,
+                    alternateRouteOptions.destinationName ?? destinationName ?? undefined,
+                    alternateRouteOptions.routeA.steps,
+                    alternateRouteOptions.navigationMode ?? navigationMode
+                  )
+                  setIsAlternateRoute(false)
+                  setAlternateRouteOptions(null)
+                }}
+                className="w-full rounded-xl border border-zinc-600 bg-zinc-800 p-4 text-left transition hover:border-cyan-500 hover:bg-zinc-700"
+              >
+                <span className="font-medium text-cyan-300">Route A</span>
+                <span className="ml-2 text-zinc-400">
+                  {alternateRouteOptions.routeA.durationMinutes} min · {alternateRouteOptions.routeA.distanceKm.toFixed(1)} km
+                </span>
+                <p className="mt-1.5 text-sm text-zinc-300">{alternateRouteOptions.tradeoffA}</p>
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  startNavigationWithPath(
+                    alternateRouteOptions.routeB.path,
+                    alternateRouteOptions.destinationName ?? destinationName ?? undefined,
+                    alternateRouteOptions.routeB.steps,
+                    alternateRouteOptions.navigationMode ?? navigationMode
+                  )
+                  setIsAlternateRoute(true)
+                  setAlternateRouteOptions(null)
+                }}
+                className="w-full rounded-xl border border-zinc-600 bg-zinc-800 p-4 text-left transition hover:border-cyan-500 hover:bg-zinc-700"
+              >
+                <span className="font-medium text-amber-300">Route B (Scenic)</span>
+                <span className="ml-2 text-zinc-400">
+                  {alternateRouteOptions.routeB.durationMinutes} min · {alternateRouteOptions.routeB.distanceKm.toFixed(1)} km
+                </span>
+                <p className="mt-1.5 text-sm text-zinc-300">{alternateRouteOptions.tradeoffB}</p>
+              </button>
+            </div>
+            <button
+              type="button"
+              onClick={() => setAlternateRouteOptions(null)}
+              className="mt-4 w-full rounded-lg bg-zinc-700 py-2 text-sm font-medium text-zinc-300 hover:bg-zinc-600"
+            >
+              Keep current route
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Demo: simulated weather for context-aware messages (e.g. "steep curves may be slippery") */}
+      {isGoMode && (
+        <div className="absolute left-4 top-20 z-20 flex items-center gap-2 rounded-lg border border-zinc-600 bg-zinc-900/95 px-2 py-1.5 text-xs backdrop-blur">
+          <span className="text-zinc-500">Weather (demo):</span>
+          <select
+            value={weatherSim}
+            onChange={(e) => setWeatherSim(e.target.value as "clear" | "rain" | "snow")}
+            className="rounded border border-zinc-600 bg-zinc-800 text-zinc-200"
+          >
+            <option value="clear">Clear</option>
+            <option value="rain">Rain</option>
+            <option value="snow">Snow</option>
+          </select>
+        </div>
+      )}
     </div>
   )
 }

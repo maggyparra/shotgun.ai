@@ -12,7 +12,7 @@ Next.js + Google Maps + Convex navigation app with voice copilot.
 1. Create `.env.local` in **John's Folder** with:
    - `NEXT_PUBLIC_CONVEX_URL` and `NEXT_PUBLIC_GOOGLE_MAPS_API_KEY`
    - `OPENAI_API_KEY` (for the voice copilot AI)
-   - Optional: `MAPBOX_ACCESS_TOKEN` (area name + enrichment), `MINIMAX_API_KEY` (human-like TTS)
+   - Optional: `MAPBOX_ACCESS_TOKEN` (area name + enrichment), `MINIMAX_API_KEY` (TTS voice; use `MINIMAX_TTS_MODEL=speech-2.8-hd` for best quality, or leave default `speech-2.8-turbo`). For **lower latency** try `MINIMAX_TTS_MODEL=speech-02-turbo` or `speech-2.6-turbo`, and set `MINIMAX_TTS_FAST_ENDPOINT=1` to use the reduced time-to-first-audio endpoint. Crime data for "is it safe to park here?" — use `CRIMEOMETER_API_KEY` (https://www.crimeometer.com/) and/or `NUMBEO_API_KEY` (city-level index; see https://www.numbeo.com/api/doc.jsp), `ELEVENLABS_API_KEY` (alternative TTS). For better voice recognition the app uses OpenAI Whisper when you tap the mic (same `OPENAI_API_KEY` as the copilot).
 2. From **John's Folder**:
    ```bash
    cd "John's Folder"

@@ -41,6 +41,7 @@ export type NavigationState = {
 
 type NavigationActions = {
   setStartPoint: (lat: number, lng: number) => void
+  clearStartPoint: () => void
   setDestination: (lat: number, lng: number, name?: string) => void
   setPath: (path: LatLng[]) => void
   startGoMode: () => void
@@ -82,6 +83,10 @@ export function NavigationProvider({ children }: { children: ReactNode }) {
 
   const setStartPoint = useCallback((lat: number, lng: number) => {
     setState((s) => ({ ...s, startPoint: { lat, lng } }))
+  }, [])
+
+  const clearStartPoint = useCallback(() => {
+    setState((s) => ({ ...s, startPoint: null }))
   }, [])
 
   const setDestination = useCallback(
@@ -178,6 +183,7 @@ export function NavigationProvider({ children }: { children: ReactNode }) {
     () => ({
       ...state,
       setStartPoint,
+      clearStartPoint,
       setDestination,
       setPath,
       startGoMode,
@@ -190,6 +196,7 @@ export function NavigationProvider({ children }: { children: ReactNode }) {
     [
       state,
       setStartPoint,
+      clearStartPoint,
       setDestination,
       setPath,
       startGoMode,
