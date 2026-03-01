@@ -1,0 +1,8 @@
+[01:22:21.342] Browser ERROR   Failed to fetch RSC payload for http://localhost:3000/. Falling back to browser navigation. {}
+[01:28:34.422] Browser ERROR   {"code":"UNKNOWN_ERROR","endpoint":"DIRECTIONS_ROUTE","name":"MapsServerError"}
+[02:25:45.545] Browser LOG     WebSocket closed with code 1006
+[02:25:45.548] Browser LOG     Attempting reconnect in 551ms
+[02:25:46.535] Browser LOG     WebSocket reconnected at t=5258.6s after disconnect due to closed with code 1006
+[02:27:16.719] Browser LOG     WebSocket closed with code 1006
+[02:27:16.719] Browser LOG     Attempting reconnect in 539ms
+[02:27:17.558] Browser LOG     WebSocket reconnected at t=5349.6s after disconnect due to closed with code 1006

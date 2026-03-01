@@ -26,6 +26,13 @@ export const addStop = mutation({
   },
 })
 
+export const removeStop = mutation({
+  args: { id: v.id("stops") },
+  handler: async (ctx, args) => {
+    await ctx.db.delete(args.id)
+  },
+})
+
 export const listStops = query({
   args: {},
   handler: async (ctx) => {

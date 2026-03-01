@@ -16,6 +16,20 @@ bun dev
 
 Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
 
+### Convex (voice add-stop, etc.)
+
+**Run Convex from this directory** (`Maggie's Folder`):
+
+```bash
+npx convex dev
+```
+
+Then in the [Convex dashboard](https://dashboard.convex.dev) → Settings → Environment Variables, add:
+
+- `NEXT_PUBLIC_GOOGLE_MAPS_API_KEY` (or `GOOGLE_MAPS_API_KEY`)
+
+In [Google Cloud Console](https://console.cloud.google.com), enable these APIs for your key: **Places API (New)**, **Places API**, and **Geocoding API**.
+
 You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
 
 This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.

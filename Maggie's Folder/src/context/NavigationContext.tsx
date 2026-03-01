@@ -33,10 +33,25 @@ export type NavigationState = {
   destinationName: string | null
 }
 
+/** Haversine distance in meters */
+function distanceMeters(a: LatLng, b: LatLng): number {
+  const R = 6371000
+  const dLat = ((b.lat - a.lat) * Math.PI) / 180
+  const dLng = ((b.lng - a.lng) * Math.PI) / 180
+  const x =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos((a.lat * Math.PI) / 180) *
+      Math.cos((b.lat * Math.PI) / 180) *
+      Math.sin(dLng / 2) ** 2
+  return R * 2 * Math.atan2(Math.sqrt(x), Math.sqrt(1 - x))
+}
+
 type NavigationActions = {
   setStartPoint: (lat: number, lng: number) => void
   setDestination: (lat: number, lng: number, name?: string) => void
   setPath: (path: LatLng[]) => void
+  /** Swap path but preserve car position — find closest point on new path, no reset to origin */
+  setPathPreservingPosition: (path: LatLng[]) => void
   startGoMode: () => void
   /** Start GO mode with a path in one update so path + car + isGoMode are set together */
   startNavigationWithPath: (path: LatLng[], destinationName?: string) => void
@@ -44,6 +59,8 @@ type NavigationActions = {
   setCarIndex: (index: number) => void
   /** Advance car by one step along path (for simulation tick) */
   tickCar: () => void
+  /** Reset car to start of path and replay the trip */
+  replayNavigation: () => void
 }
 
 const defaultState: NavigationState = {
@@ -85,6 +102,29 @@ export function NavigationProvider({ children }: { children: ReactNode }) {
       carIndex: 0,
       carPosition: path.length > 0 ? path[0] : null,
     }))
+  }, [])
+
+  const setPathPreservingPosition = useCallback((newPath: LatLng[]) => {
+    if (newPath.length === 0) return
+    setState((s) => {
+      const pos = s.carPosition ?? (s.path[s.carIndex] ?? null)
+      if (!pos) return { ...s, path: newPath, carIndex: 0, carPosition: newPath[0] }
+      let bestIdx = 0
+      let bestD = Infinity
+      for (let i = 0; i < newPath.length; i++) {
+        const d = distanceMeters(pos, newPath[i])
+        if (d < bestD) {
+          bestD = d
+          bestIdx = i
+        }
+      }
+      return {
+        ...s,
+        path: newPath,
+        carIndex: bestIdx,
+        carPosition: newPath[bestIdx],
+      }
+    })
   }, [])
 
   const startGoMode = useCallback(() => {
@@ -137,28 +177,43 @@ export function NavigationProvider({ children }: { children: ReactNode }) {
     })
   }, [])
 
+  const replayNavigation = useCallback(() => {
+    setState((s) => {
+      if (!s.isGoMode || s.path.length === 0) return s
+      return {
+        ...s,
+        carIndex: 0,
+        carPosition: s.path[0],
+      }
+    })
+  }, [])
+
   const value = useMemo(
     () => ({
       ...state,
       setStartPoint,
       setDestination,
       setPath,
+      setPathPreservingPosition,
       startGoMode,
       startNavigationWithPath,
       stopGoMode,
       setCarIndex,
       tickCar,
+      replayNavigation,
     }),
     [
       state,
       setStartPoint,
       setDestination,
       setPath,
+      setPathPreservingPosition,
       startGoMode,
       startNavigationWithPath,
       stopGoMode,
       setCarIndex,
       tickCar,
+      replayNavigation,
     ],
   )
 
